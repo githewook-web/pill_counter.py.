@@ -15,7 +15,7 @@ file_to_use = uploaded_file or camera_file
 # ---------- Helpers ----------
 def _safe_open_image(file):
     pil = Image.open(file)
-    pil = ImageOps.exif_transpose(pil)   # fix orientation from phones
+    pil = ImageOps.exif_transpose(pil)   # fix phone EXIF rotation
     pil = pil.convert("RGB")
     return pil
 
@@ -31,7 +31,6 @@ def _size_aware_sigma(gray):
     return max(7, min(45, round(min(h, w) / 24)))
 
 def illum_norm(gray):
-    # divide by heavy blur to flatten slowly-varying light
     sigma = _size_aware_sigma(gray)
     blur = cv2.GaussianBlur(gray, (0, 0), sigmaX=sigma, sigmaY=sigma)
     blur = np.clip(blur, 1, 255)
@@ -45,17 +44,12 @@ def _morph_kernel(gray, frac=1/30, kmin=9, kmax=41):
     return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
 
 def enhance_pills(gray):
-    """
-    Make pill tops bright and suppress soft shadows:
-      - white tophat boosts small bright domes
-      - blackhat subtracts soft dark halos
-    """
+    """Boost pill tops, tame soft shadows (gentler than before)."""
     se = _morph_kernel(gray)
-    tophat  = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT,  se)
-    blackhat= cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, se)
-    # stronger pill preference, weaker shadow
-    tmp = cv2.addWeighted(gray, 0.55, tophat, 0.45, 0)
-    out = cv2.subtract(tmp, cv2.multiply(blackhat, 0.6).astype(np.uint8))
+    tophat   = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT,  se)
+    blackhat = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, se)
+    tmp = cv2.addWeighted(gray, 0.60, tophat, 0.40, 0)
+    out = cv2.subtract(tmp, (blackhat * 0.45).astype(np.uint8))  # was ~0.6
     return out
 
 def clear_border(mask, pct=0.02):
@@ -66,10 +60,7 @@ def clear_border(mask, pct=0.02):
     return mask
 
 def floodfill_background(mask):
-    """
-    Remove anything connected to the image edge (tray/background) using flood-fill
-    on the *inverse* mask from the four corners.
-    """
+    """Remove anything connected to image corners (tray/background)."""
     inv = cv2.bitwise_not(mask)
     h, w = mask.shape[:2]
     ffmask = np.zeros((h+2, w+2), dtype=np.uint8)
@@ -104,30 +95,26 @@ def mask_otsu(gray, invert):
     m = floodfill_background(m)
     return morph_clean(m)
 
-def _distance_local_maxima(mask, thresh_frac=0.35, nms_ksize=7):
+def _distance_local_maxima(mask, thresh_frac=0.20, nms_ksize=5):
     """
     Seeds for watershed: local maxima of distance transform.
-    Avoids single giant region by forcing multiple interior peaks.
+    Loosened thresholds to ensure one seed per pill under shadow.
     """
     dist = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
-    # basic non-max suppression by dilation-equality
     k = cv2.getStructuringElement(cv2.MORPH_RECT, (nms_ksize, nms_ksize))
     local_max = (dist == cv2.dilate(dist, k))
-    # keep only sufficiently strong peaks
-    strong = dist > (dist.max() * thresh_frac)
+    strong = dist > (dist.max() * thresh_frac)  # was 0.35–0.40
     peaks = np.logical_and(local_max, strong).astype(np.uint8) * 255
-    # label peaks
     num_labels, markers = cv2.connectedComponents(peaks)
     return num_labels, markers, dist
 
 def watershed_split(mask, small_batch):
     if mask is None or mask.size == 0 or mask.max() == 0:
         return mask
-    # seeds from distance local maxima (better than global fg_ratio)
+    # Looser, more numerous seeds
     _, markers, _ = _distance_local_maxima(mask,
-                                           thresh_frac=0.40 if small_batch else 0.30,
-                                           nms_ksize=7)
-    # unknown region = mask eroded from border
+                                           thresh_frac=0.20,
+                                           nms_ksize=5)
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
     sure_bg = cv2.dilate(mask, k, iterations=2)
     unknown = cv2.subtract(sure_bg, mask)
@@ -139,8 +126,8 @@ def watershed_split(mask, small_batch):
     return out
 
 def robust_area_bounds(cnts, img_area, small_batch):
-    g_min = int(img_area * 0.0008)   # tiny tablet far from camera
-    g_max = int(img_area * 0.18)     # avoid tray edges/merged blobs
+    g_min = int(img_area * 0.0008)
+    g_max = int(img_area * 0.18)
     if len(cnts) < 15:
         return g_min, g_max
     areas = np.array([cv2.contourArea(c) for c in cnts], dtype=np.float32)
@@ -171,13 +158,12 @@ def filter_contours(cnts, img_area, small_batch):
         ar = max(w, h) / max(1, min(w, h))
         if ar > max_ar:
             continue
-        # circularity gate (reject shadows/strips)
+        # Relaxed circularity gate (0.50 instead of 0.60)
         peri = cv2.arcLength(c, True) + 1e-6
         circ = 4 * math.pi * a / (peri * peri)
-        if circ < 0.60:  # 1.0=perfect circle
+        if circ < 0.50:
             continue
         kept.append(c)
-    # safety net: if we filtered to zero but had candidates, keep a few largest
     if not kept and cnts:
         cnts_sorted = sorted(cnts, key=lambda c: cv2.contourArea(c), reverse=True)
         kept = cnts_sorted[: min(5, len(cnts_sorted))]
