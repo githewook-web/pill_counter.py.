@@ -20,7 +20,7 @@ def downscale(bgr, max_dim=1800):
     return cv2.resize(bgr, (int(w*s), int(h*s)), interpolation=cv2.INTER_AREA)
 
 def illum_norm(gray):
-    # flatten slow lighting gradients
+    # flatten slow lighting gradients (fluorescent/stainless)
     blur = cv2.GaussianBlur(gray, (0,0), 33)
     blur = np.clip(blur, 1, 255)
     norm = (gray.astype(np.float32) / blur.astype(np.float32)) * 255.0
@@ -44,7 +44,7 @@ def mask_otsu(gray, invert):
         _, m = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     return morph(m)
 
-def watershed_split(mask, fg_ratio=0.45):
+def watershed_split(mask, fg_ratio):
     if mask.max() == 0:
         return mask
     dist = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
@@ -61,35 +61,51 @@ def watershed_split(mask, fg_ratio=0.45):
     out[markers > 1] = 255
     return out
 
-def robust_area_bounds(cnts, img_area):
-    """Pick min/max contour area using percentiles with safe global clamps."""
+def robust_area_bounds(cnts, img_area, small_batch):
+    # Global clamps (prevent "filter to zero")
+    g_min = int(img_area * 0.0008)   # very small tablet at phone distance
+    g_max = int(img_area * 0.18)     # avoid tray edges / huge blobs
+
+    if len(cnts) < 15:
+        # Small-batch bias: be generous; rely on solidity/shape to reject junk
+        return g_min, g_max
+
     areas = np.array([cv2.contourArea(c) for c in cnts], dtype=np.float32)
-    areas = areas[areas > img_area * 0.0004]  # ignore dust
+    areas = areas[areas > img_area * 0.0004]
     if areas.size == 0:
-        return int(img_area*0.001), int(img_area*0.25)
-    p25, p75 = np.percentile(areas, [25, 75])
-    min_a = max(int(p25 * 0.40), int(img_area * 0.0008))
-    max_a = min(int(p75 * 3.0),  int(img_area * 0.20))
+        return g_min, g_max
+
+    p20, p80 = np.percentile(areas, [20, 80])
+    min_a = max(int(p20 * 0.5), g_min)
+    max_a = min(int(p80 * 2.5), g_max)
     if min_a >= max_a:
-        min_a = int(img_area*0.001)
-        max_a = int(img_area*0.20)
+        min_a, max_a = g_min, g_max
     return min_a, max_a
 
-def filter_pills(cnts, img_area, min_a, max_a):
+def filter_pills(cnts, img_area, min_a, max_a, small_batch):
     keep = []
+    # Shape gates: slightly stricter for small batches
+    min_solidity = 0.82 if small_batch else 0.80
+    max_ar       = 3.0  if small_batch else 4.0  # aspect ratio (capsules ok, strips no)
+
     for c in cnts:
         a = cv2.contourArea(c)
         if a < min_a or a > max_a:
             continue
         hull = cv2.convexHull(c)
         ha = cv2.contourArea(hull) + 1e-6
-        if a / ha < 0.80:  # solidity: drop ragged/edge junk
+        if a / ha < min_solidity:
             continue
         x,y,w,h = cv2.boundingRect(c)
-        ar = max(w,h)/max(1,min(w,h))  # aspect ratio: allow round/oval/capsule
-        if ar > 4.0:
+        ar = max(w,h) / max(1, min(w,h))
+        if ar > max_ar:
             continue
         keep.append(c)
+
+    # Safety net: never return zero if there were candidates
+    if not keep and cnts:
+        cnts_sorted = sorted(cnts, key=lambda c: cv2.contourArea(c), reverse=True)
+        keep = cnts_sorted[: min(5, len(cnts_sorted))]  # keep a few largest blobs
     return keep
 
 def draw(bgr, cnts, count):
@@ -108,23 +124,26 @@ if file_to_use is not None:
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     gray = illum_norm(gray)
 
-    # Build four simple masks (handle light/dark pills and lighting)
-    m1 = mask_adaptive(gray, invert=True)    # light pills on dark
-    m2 = mask_adaptive(gray, invert=False)   # dark pills on light
+    # Four simple masks (covers light/dark pills + different backgrounds)
+    m1 = mask_adaptive(gray, invert=True)
+    m2 = mask_adaptive(gray, invert=False)
     m3 = mask_otsu(gray, invert=True)
     m4 = mask_otsu(gray, invert=False)
-
     merged = cv2.bitwise_or(cv2.bitwise_or(m1, m2), cv2.bitwise_or(m3, m4))
     merged = morph(merged)
 
-    # Split touching
-    split = watershed_split(merged, fg_ratio=0.45)
+    # Watershed split (stronger split for small batches)
+    # First estimate small vs large from raw components
+    cnts_est, _ = cv2.findContours(merged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    small_batch = len(cnts_est) <= 50
+    fg_ratio = 0.42 if small_batch else 0.48
+    split = watershed_split(merged, fg_ratio=fg_ratio)
 
-    # Learn reasonable area bounds then filter
+    # Learn bounds, then filter
     cnts_loose, _ = cv2.findContours(split, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     img_area = split.shape[0] * split.shape[1]
-    min_a, max_a = robust_area_bounds(cnts_loose, img_area)
-    cnts = filter_pills(cnts_loose, img_area, min_a, max_a)
+    min_a, max_a = robust_area_bounds(cnts_loose, img_area, small_batch)
+    cnts = filter_pills(cnts_loose, img_area, min_a, max_a, small_batch)
 
     count = len(cnts)
     rgb = draw(bgr, cnts, count)
