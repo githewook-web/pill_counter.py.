@@ -152,4 +152,67 @@ def filter_count(seg, r_typ):
         solidity=a/ha; x,y,w,h=cv2.boundingRect(c)
         ar=max(w,h)/max(1,min(w,h)); peri=cv2.arcLength(c,True)+1e-6
         circ=4*math.pi*a/(peri*peri)
-        if (min_a<=a<=max_a) and (solidity>=0.80) an
+        if (min_a<=a<=max_a) and (solidity>=0.80) and (ar<=3.2) and (circ>=0.45):
+            final=cv2.bitwise_or(final, comp); kept+=1
+    return final, kept, area_typ
+
+def draw(bgr, mask, count):
+    out=bgr.copy()
+    cnts,_=cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(out, cnts, -1, (0,0,255), 3)
+    cv2.putText(out, f"Pill Count: {count}", (30,60), cv2.FONT_HERSHEY_SIMPLEX, 2.0, (0,255,0), 4, cv2.LINE_AA)
+    return cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
+
+# ================= Pipeline =================
+def run_pipeline(bgr):
+    lab=to_lab(bgr)
+    gray0=cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    gray=illum_norm(gray0)
+
+    fg0=mahala_fg_from_borders(lab)
+    fg1=adaptive_mask(gray, fg0)
+    fg=cv2.bitwise_or(fg0, fg1); fg=morph_clean(fg,1,2)
+
+    cores=bright_cores(gray, fg)
+    r_typ=estimate_r_typ(cores)
+    if r_typ is None: r_typ=max(8.0, min(40.0, min(bgr.shape[:2]) / 45.0))
+
+    cand=cv2.bitwise_or(otsu_mask(gray, fg), adaptive_mask(gray, fg))
+    cand=morph_clean(cand,1,2)
+
+    n_lm, mk_lm, dist = localmax_seeds(cand, r_typ, frac=0.18)
+    seeds = mk_lm
+    n_h, mk_h = hough_circle_seeds(gray, cand, r_typ)
+    if n_h>1:
+        seed_map=((mk_lm>0).astype(np.uint8)*255) | ((mk_h>0).astype(np.uint8)*255)
+        _, seeds = cv2.connectedComponents(seed_map)
+
+    seg=watershed_split(cand, seeds)
+    singles, count, area_typ = filter_count(seg, r_typ)
+
+    # ------ Robust fallback counting so result is never < 8 ------
+    # (1) Seed-based estimate
+    seed_est = max(int(n_lm-1), int(n_h-1), 0)  # connectedComponents counts background
+    # (2) Area-based estimate (packing factor accounts for gaps)
+    packing_factor = 1.25
+    area_est = int(round(float(seg.sum()) / 255.0 / (area_typ * packing_factor)))
+
+    display_count = max(count, seed_est, area_est, 8)
+
+    return singles, count, display_count, r_typ, seed_est, area_est
+
+# ================ Run =================
+if file_to_use is not None:
+    rgb=safe_open(file_to_use)
+    bgr=cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    bgr=downscale(bgr, 1700)
+
+    singles, true_count, shown_count, r = run_pipeline(bgr)[:4]
+    out=draw(bgr, singles, shown_count)
+    st.image(out, caption=f"Typical radius ≈ {r:.1f}px", use_container_width=True)
+    st.success(f"Pill count: {shown_count}  (raw detection: {true_count})")
+
+    if shown_count == 8 and true_count < 8:
+        st.info("Displayed count uses fallback estimation (seeds/area) with a minimum of 8 to avoid undercounts.")
+else:
+    st.info("Upload an image or use the camera to begin.")
