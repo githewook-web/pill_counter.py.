@@ -14,9 +14,8 @@ file_to_use = uploaded_file or camera_file
 
 # ---------- Helpers ----------
 def _safe_open_image(file):
-    """Open safely, fix EXIF rotation, force RGB."""
     pil = Image.open(file)
-    pil = ImageOps.exif_transpose(pil)
+    pil = ImageOps.exif_transpose(pil)   # fix orientation from phones
     pil = pil.convert("RGB")
     return pil
 
@@ -28,70 +27,59 @@ def downscale(bgr, max_dim=1800):
     return cv2.resize(bgr, (int(w*s), int(h*s)), interpolation=cv2.INTER_AREA)
 
 def _size_aware_sigma(gray):
-    """Pick a blur sigma relative to size to avoid over/under-flattening."""
     h, w = gray.shape[:2]
     return max(7, min(45, round(min(h, w) / 24)))
 
 def illum_norm(gray):
-    """Flatten slow lighting gradients; robust for both small & large images."""
+    # divide by heavy blur to flatten slowly-varying light
     sigma = _size_aware_sigma(gray)
     blur = cv2.GaussianBlur(gray, (0, 0), sigmaX=sigma, sigmaY=sigma)
     blur = np.clip(blur, 1, 255)
     norm = (gray.astype(np.float32) / blur.astype(np.float32)) * 255.0
     return np.clip(norm, 0, 255).astype(np.uint8)
 
-def tophat_enhance(gray):
-    """Boost bright pill bodies vs soft shadows using white tophat."""
-    h, w = gray.shape[:2]
-    k = int(max(9, min(41, round(min(h, w) / 30))))  # odd-ish range
+def _morph_kernel(gray, frac=1/30, kmin=9, kmax=41):
+    k = int(max(kmin, min(kmax, round(min(gray.shape[:2]) * frac))))
     if k % 2 == 0:
         k += 1
-    se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-    th = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, se)
-    # Blend a little with normalized image to keep edges but suppress halos
-    out = cv2.addWeighted(gray, 0.65, th, 0.35, 0)
+    return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+
+def enhance_pills(gray):
+    """
+    Make pill tops bright and suppress soft shadows:
+      - white tophat boosts small bright domes
+      - blackhat subtracts soft dark halos
+    """
+    se = _morph_kernel(gray)
+    tophat  = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT,  se)
+    blackhat= cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, se)
+    # stronger pill preference, weaker shadow
+    tmp = cv2.addWeighted(gray, 0.55, tophat, 0.45, 0)
+    out = cv2.subtract(tmp, cv2.multiply(blackhat, 0.6).astype(np.uint8))
     return out
 
 def clear_border(mask, pct=0.02):
-    """Zero a thin border so frames/edges never become one giant contour."""
     h, w = mask.shape[:2]
     m = int(round(min(h, w) * pct))
-    if m < 1:
-        return mask
-    mask[:m, :] = 0
-    mask[-m:, :] = 0
-    mask[:, :m] = 0
-    mask[:, -m:] = 0
+    if m < 1: return mask
+    mask[:m, :] = 0; mask[-m:, :] = 0; mask[:, :m] = 0; mask[:, -m:] = 0
     return mask
 
-def floodfill_background(mask, fill_value=0):
+def floodfill_background(mask):
     """
-    Remove any foreground connected to the image border (tray/background)
-    by flood-filling from the 4 corners on the *mask*'s foreground.
+    Remove anything connected to the image edge (tray/background) using flood-fill
+    on the *inverse* mask from the four corners.
     """
+    inv = cv2.bitwise_not(mask)
     h, w = mask.shape[:2]
-    m = mask.copy()
-    ff = m.copy()
-    # We flood on the *inverse* to carve away big connected background,
-    # then invert back to the original polarity.
-    inv = cv2.bitwise_not(ff)
-    hpad, wpad = h + 2, w + 2
-    ff_mask = np.zeros((hpad, wpad), dtype=np.uint8)
-
-    for seed in [(0, 0), (0, w - 1), (h - 1, 0), (h - 1, w - 1)]:
-        ff_mask[...] = 0
-        inv2 = inv.copy()
-        cv2.floodFill(inv2, ff_mask, seedPoint=(seed[1], seed[0]), newVal=0)
-        inv = inv2
-
-    cleaned = cv2.bitwise_not(inv)
-    if fill_value == 0:
-        return cleaned
-    # optional polarity control
-    return np.where(cleaned > 0, fill_value, 0).astype(np.uint8)
+    ffmask = np.zeros((h+2, w+2), dtype=np.uint8)
+    for seed in [(0,0),(0,w-1),(h-1,0),(h-1,w-1)]:
+        ffmask[:] = 0
+        cv2.floodFill(inv, ffmask, seedPoint=(seed[1], seed[0]), newVal=0)
+    return cv2.bitwise_not(inv)
 
 def morph_clean(mask):
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k, iterations=2)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=1)
     return mask
@@ -105,25 +93,44 @@ def mask_adaptive(gray, invert, cval=10):
     typ = cv2.THRESH_BINARY_INV if invert else cv2.THRESH_BINARY
     block = _adaptive_block_size(gray)
     m = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, typ, block, cval)
-    return morph_clean(clear_border(floodfill_background(m)))
+    m = clear_border(m)
+    m = floodfill_background(m)
+    return morph_clean(m)
 
 def mask_otsu(gray, invert):
-    if invert:
-        _, m = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    else:
-        _, m = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    return morph_clean(clear_border(floodfill_background(m)))
+    flag = cv2.THRESH_BINARY_INV if invert else cv2.THRESH_BINARY
+    _, m = cv2.threshold(gray, 0, 255, flag + cv2.THRESH_OTSU)
+    m = clear_border(m)
+    m = floodfill_background(m)
+    return morph_clean(m)
 
-def watershed_split(mask, fg_ratio=0.45):
+def _distance_local_maxima(mask, thresh_frac=0.35, nms_ksize=7):
+    """
+    Seeds for watershed: local maxima of distance transform.
+    Avoids single giant region by forcing multiple interior peaks.
+    """
+    dist = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
+    # basic non-max suppression by dilation-equality
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (nms_ksize, nms_ksize))
+    local_max = (dist == cv2.dilate(dist, k))
+    # keep only sufficiently strong peaks
+    strong = dist > (dist.max() * thresh_frac)
+    peaks = np.logical_and(local_max, strong).astype(np.uint8) * 255
+    # label peaks
+    num_labels, markers = cv2.connectedComponents(peaks)
+    return num_labels, markers, dist
+
+def watershed_split(mask, small_batch):
     if mask is None or mask.size == 0 or mask.max() == 0:
         return mask
-    dist = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
-    _, sure_fg = cv2.threshold(dist, fg_ratio * dist.max(), 255, 0)
-    sure_fg = sure_fg.astype(np.uint8)
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    # seeds from distance local maxima (better than global fg_ratio)
+    _, markers, _ = _distance_local_maxima(mask,
+                                           thresh_frac=0.40 if small_batch else 0.30,
+                                           nms_ksize=7)
+    # unknown region = mask eroded from border
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
     sure_bg = cv2.dilate(mask, k, iterations=2)
-    unknown = cv2.subtract(sure_bg, sure_fg)
-    _, markers = cv2.connectedComponents(sure_fg)
+    unknown = cv2.subtract(sure_bg, mask)
     markers = markers + 1
     markers[unknown == 255] = 0
     markers = cv2.watershed(cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR), markers)
@@ -132,8 +139,8 @@ def watershed_split(mask, fg_ratio=0.45):
     return out
 
 def robust_area_bounds(cnts, img_area, small_batch):
-    g_min = int(img_area * 0.0008)
-    g_max = int(img_area * 0.18)
+    g_min = int(img_area * 0.0008)   # tiny tablet far from camera
+    g_max = int(img_area * 0.18)     # avoid tray edges/merged blobs
     if len(cnts) < 15:
         return g_min, g_max
     areas = np.array([cv2.contourArea(c) for c in cnts], dtype=np.float32)
@@ -164,26 +171,28 @@ def filter_contours(cnts, img_area, small_batch):
         ar = max(w, h) / max(1, min(w, h))
         if ar > max_ar:
             continue
+        # circularity gate (reject shadows/strips)
+        peri = cv2.arcLength(c, True) + 1e-6
+        circ = 4 * math.pi * a / (peri * peri)
+        if circ < 0.60:  # 1.0=perfect circle
+            continue
         kept.append(c)
+    # safety net: if we filtered to zero but had candidates, keep a few largest
     if not kept and cnts:
         cnts_sorted = sorted(cnts, key=lambda c: cv2.contourArea(c), reverse=True)
         kept = cnts_sorted[: min(5, len(cnts_sorted))]
     return kept
 
 def quality_score(cnts):
-    if not cnts:
-        return 0.0
+    if not cnts: return 0.0
     areas = np.array([cv2.contourArea(c) for c in cnts], dtype=np.float32)
     m, s = float(areas.mean()), float(areas.std())
-    if m <= 1:
-        return 0.0
+    if m <= 1: return 0.0
     cv = s / m
-    cv_term = 1.0 / (1.0 + cv)                 # lower spread is better
-    n_term  = 1.0 - math.exp(-len(cnts) / 10.0)
-    return 0.6 * cv_term + 0.4 * n_term
+    return 0.6 * (1.0 / (1.0 + cv)) + 0.4 * (1.0 - math.exp(-len(cnts) / 10.0))
 
 def process_one_mask(mask, small_batch):
-    mask = watershed_split(mask, fg_ratio=0.42 if small_batch else 0.48)
+    mask = watershed_split(mask, small_batch=small_batch)
     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     img_area = mask.shape[0] * mask.shape[1]
     kept = filter_contours(cnts, img_area, small_batch)
@@ -204,31 +213,25 @@ if file_to_use is not None:
 
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     gray = illum_norm(gray)
-    gray = tophat_enhance(gray)  # suppress soft shadows, emphasize pill bodies
+    gray = enhance_pills(gray)
 
-    # Build several masks independently; evaluate each rather than OR-merge.
+    # Build independent candidates; score instead of OR-merging
     candidates = []
-    for _ in range(2):  # two passes gives slight diversity without bloat
+    for _ in range(2):
         candidates.append(mask_adaptive(gray, invert=True,  cval=10))
         candidates.append(mask_adaptive(gray, invert=False, cval=10))
     candidates.append(mask_otsu(gray, invert=True))
     candidates.append(mask_otsu(gray, invert=False))
 
-    # Heuristic: if many pixels are foreground across masks, treat as large-batch
     nz = [int(np.count_nonzero(m)) for m in candidates]
-    small_batch = np.median(nz) < (gray.size * 0.10) if len(nz) else True
+    small_batch = np.median(nz) < (gray.size * 0.10) if nz else True
 
     results = []
     for m in candidates:
         kept, score = process_one_mask(m.copy(), small_batch=small_batch)
         results.append((kept, score))
 
-    kept_best = []
-    if any(len(k) > 0 for k, _ in results):
-        kept_best, _ = max(results, key=lambda r: r[1])
-    else:
-        kept_best = max(results, key=lambda r: len(r[0]))[0] if results else []
-
+    kept_best = max(results, key=lambda r: (len(r[0]) > 0, r[1], len(r[0])))[0] if results else []
     count = len(kept_best)
     rgb = draw_result(bgr, kept_best, count)
     st.image(rgb, caption="Detected pills with count overlay", use_container_width=True)
